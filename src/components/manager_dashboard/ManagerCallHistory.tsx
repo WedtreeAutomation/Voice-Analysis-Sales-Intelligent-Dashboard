@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
-import { collection, query, getDocs, orderBy, Timestamp } from 'firebase/firestore';
+import { collection, query, getDocs, orderBy, where, Timestamp, QueryConstraint } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { Tooltip, ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from 'recharts';
 import { Phone, Filter, ChevronDown, Users, ArrowRight, Play, Pause, SortAsc, SortDesc, BarChart3, Clock, TrendingUp, MessageCircle, Target, Heart, Shield, Star, Award, Volume2, AlertCircle, Tags, Mic, X, PhoneOff, PhoneMissed, UserCheck, Hash, Activity, Zap, Download, Calendar, Check } from 'lucide-react';
@@ -210,19 +210,9 @@ const dateFilterOptions = [
     { value: 'custom', label: 'Custom Range', color: 'bg-pink-500' },
 ];
 
-const LANGUAGE_COLORS = {
-    English: '#3B82F6',
-    Hindi: '#EF4444',
-    Tamil: '#10B981',
-    Telugu: '#F59E0B',
-    Kannada: '#8B5CF6',
-    Malayalam: '#EC4899',
-    Other: '#6B7280'
-};
-
 const ITEMS_PER_PAGE = 10;
 
-export default function ManagerCallHistory({ setActiveView, user, isDarkMode }: ManagerCallHistoryProps) {
+export default function ManagerCallHistory({isDarkMode }: ManagerCallHistoryProps) {
     const [selectedAgent, setSelectedAgent] = useState<string>('all');
     const [dateFilter, setDateFilter] = useState<DateFilter>('today');
     const [callView, setCallView] = useState<CallView>('answered');
@@ -245,7 +235,7 @@ export default function ManagerCallHistory({ setActiveView, user, isDarkMode }: 
     const [audioPlaying, setAudioPlaying] = useState<string | null>(null);
     const [audioElement, setAudioElement] = useState<HTMLAudioElement | null>(null);
     const [currentPage, setCurrentPage] = useState(1);
-    const [minCallsThreshold, setMinCallsThreshold] = useState<number>(3); 
+    const [minCallsThreshold, setMinCallsThreshold] = useState<number>(2); 
 
     const [callTypeFilter, setCallTypeFilter] = useState<'all' | 'INCOMING' | 'C2C'>('all');
     const [resolutionFilter, setResolutionFilter] = useState<'all' | 'Agent Callback' | 'Attended Later' | 'Pending'>('all');
@@ -259,8 +249,11 @@ export default function ManagerCallHistory({ setActiveView, user, isDarkMode }: 
     const resolutionDropdownRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
+        // For custom range, only fetch once both dates are selected
+        if (dateFilter === 'custom' && (!customStartDate || !customEndDate)) return;
         fetchAllData();
-    }, []);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [dateFilter, customStartDate, customEndDate]);
 
     useEffect(() => {
         function handleClickOutside(event: MouseEvent) {
@@ -285,19 +278,78 @@ export default function ManagerCallHistory({ setActiveView, user, isDarkMode }: 
     // Resets page on view change
     useEffect(() => { setCurrentPage(1); }, [callView, dateFilter]);
 
-    // Single mega fetch function on mount
+    // Build Firestore date range constraints from current filter state.
+    // Returns null when no date restriction should be applied (i.e. 'all').
+    const buildDateConstraints = (): { start: Timestamp; end: Timestamp } | null => {
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+        switch (dateFilter) {
+            case 'today':
+                return {
+                    start: Timestamp.fromDate(today),
+                    end: Timestamp.fromDate(new Date(today.getTime() + 24 * 60 * 60 * 1000 - 1)),
+                };
+            case 'yesterday': {
+                const yStart = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+                return {
+                    start: Timestamp.fromDate(yStart),
+                    end: Timestamp.fromDate(new Date(today.getTime() - 1)),
+                };
+            }
+            case 'week':
+                return {
+                    start: Timestamp.fromDate(new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000)),
+                    end: Timestamp.fromDate(now),
+                };
+            case 'month':
+                return {
+                    start: Timestamp.fromDate(new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000)),
+                    end: Timestamp.fromDate(now),
+                };
+            case 'custom':
+                if (customStartDate && customEndDate) {
+                    return {
+                        start: Timestamp.fromDate(new Date(customStartDate)),
+                        end: Timestamp.fromDate(
+                            new Date(new Date(customEndDate).getTime() + 24 * 60 * 60 * 1000 - 1)
+                        ),
+                    };
+                }
+                return null;
+            default:
+                return null; // 'all' — no constraint
+        }
+    };
+
+    // Fetch only the records relevant to the currently selected date window.
+    // For 'all' time we still cap at 500 docs to protect the browser; managers
+    // can use the date filters or CSV export to access older records.
+    const ALL_TIME_LIMIT = 500;
+
     const fetchAllData = async () => {
         try {
             setLoading(true);
 
-            // Fetch Agents
+            // Agents collection is small — fetch everything
             const agentsSnapshot = await getDocs(query(collection(db, 'agents')));
             const agentsData = agentsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Agent[];
             setAgents(agentsData);
 
-            // Fetch Answered Calls
-            const callsQuery = query(collection(db, 'call_analysis'), orderBy('timestamp', 'desc'));
-            const callsSnapshot = await getDocs(callsQuery);
+            // Build query constraints for call_analysis
+            // IMPORTANT: Firestore requires where() BEFORE orderBy() for range queries.
+            const dateRange = buildDateConstraints();
+            const callConstraints: QueryConstraint[] = [];
+            if (dateRange) {
+                callConstraints.push(where('timestamp', '>=', dateRange.start));
+                callConstraints.push(where('timestamp', '<=', dateRange.end));
+            } else {
+                const { limit } = await import('firebase/firestore');
+                callConstraints.push(limit(ALL_TIME_LIMIT));
+            }
+            callConstraints.push(orderBy('timestamp', 'desc'));
+
+            const callsSnapshot = await getDocs(query(collection(db, 'call_analysis'), ...callConstraints));
             const callsData = callsSnapshot.docs.map(doc => {
                 const data = doc.data();
                 return {
@@ -325,25 +377,59 @@ export default function ManagerCallHistory({ setActiveView, user, isDarkMode }: 
                         agentMood: data.toneAnalysis?.agentMood || 'N/A',
                         customerMood: data.toneAnalysis?.customerMood || 'N/A',
                         toneMark: data.toneAnalysis?.toneMark || 0,
-                        reasoning: data.toneAnalysis?.reasoning || 'No acoustic data available.'
-                    }
+                        reasoning: data.toneAnalysis?.reasoning || 'No acoustic data available.',
+                    },
                 } as CallRecord;
             });
             setCalls(callsData);
 
-            // Fetch Missed Calls
-            const missedCallsQuery = query(collection(db, 'missed_calls'), orderBy('date', 'desc'));
-            const missedCallsSnapshot = await getDocs(missedCallsQuery);
+            // missed_calls documents are keyed as DD-MM-YYYY (e.g. "25-05-2026").
+            // We fetch the specific day documents directly by ID instead of using a
+            // where() range query — this avoids the DD-MM-YYYY vs YYYY-MM-DD mismatch
+            // that caused string comparisons to break.
+            const toDDMMYYYY = (d: Date): string => {
+                const dd = String(d.getDate()).padStart(2, '0');
+                const mm = String(d.getMonth() + 1).padStart(2, '0');
+                const yyyy = d.getFullYear();
+                return `${dd}-${mm}-${yyyy}`;
+            };
+
+            // Build the list of DD-MM-YYYY doc IDs to fetch
+            const docIdsToFetch: string[] = [];
+            if (dateRange) {
+                // Walk from start date to end date, one day at a time
+                const cursor = new Date(dateRange.start.toDate());
+                cursor.setHours(0, 0, 0, 0);
+                const endDay = new Date(dateRange.end.toDate());
+                endDay.setHours(23, 59, 59, 999);
+                while (cursor <= endDay) {
+                    docIdsToFetch.push(toDDMMYYYY(cursor));
+                    cursor.setDate(cursor.getDate() + 1);
+                }
+            } else {
+                // 'all' — fetch the last 30 days to avoid loading everything
+                const today = new Date();
+                for (let i = 0; i < 30; i++) {
+                    const d = new Date(today);
+                    d.setDate(today.getDate() - i);
+                    docIdsToFetch.push(toDDMMYYYY(d));
+                }
+            }
+
             let allMissedCalls: MissedCall[] = [];
-            
-            missedCallsSnapshot.docs.forEach(doc => {
-                const data = doc.data();
+            // Fetch each day doc in parallel using getDoc by known ID
+            const { doc: docRef, getDoc } = await import('firebase/firestore');
+            const missedSnapshots = await Promise.all(
+                docIdsToFetch.map(id => getDoc(docRef(db, 'missed_calls', id)))
+            );
+            missedSnapshots.forEach(snap => {
+                if (!snap.exists()) return;
+                const data = snap.data();
                 if (data.calls && Array.isArray(data.calls)) {
-                    const callsWithDate = data.calls.map((call: any) => ({
-                        ...call,
-                        date: data.date 
-                    }));
-                    allMissedCalls = [...allMissedCalls, ...callsWithDate];
+                    allMissedCalls = [
+                        ...allMissedCalls,
+                        ...data.calls.map((call: any) => ({ ...call, date: data.date })),
+                    ];
                 }
             });
             setRawMissedCalls(allMissedCalls);
@@ -383,142 +469,156 @@ export default function ManagerCallHistory({ setActiveView, user, isDarkMode }: 
         }
     };
 
-    const computedDateRange = useMemo(() => {
-        if (dateFilter === 'all') return null;
-        
-        const now = new Date();
-        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
-        switch (dateFilter) {
-            case 'today': return { start: today, end: new Date(today.getTime() + 24 * 60 * 60 * 1000 - 1) };
-            case 'yesterday': return { start: new Date(today.getTime() - 24 * 60 * 60 * 1000), end: new Date(today.getTime() - 1) };
-            case 'week': return { start: new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000), end: now };
-            case 'month': return { start: new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000), end: now };
-            case 'custom':
-                if (customStartDate && customEndDate) {
-                    return {
-                        start: new Date(customStartDate),
-                        end: new Date(new Date(customEndDate).getTime() + 24 * 60 * 60 * 1000 - 1)
-                    };
-                }
-                return null;
-            default: return null;
-        }
-    }, [dateFilter, customStartDate, customEndDate]);
-
-    const isDateInRange = (timestamp: Timestamp | any, range: {start: Date, end: Date} | null) => {
-        if (!range || !timestamp) return true;
+    const toDate = (ts: any): Date | null => {
+        if (!ts) return null;
         try {
-            const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp.seconds * 1000);
-            return date >= range.start && date <= range.end;
-        } catch { return false; }
+            if (typeof ts.toDate === 'function') return ts.toDate();
+            if (typeof ts.seconds === 'number') return new Date(ts.seconds * 1000);
+        } catch { /* ignore */ }
+        return null;
     };
+    
+    const callsByCallerMap = useMemo(() => {
+        const map = new Map<string, CallRecord[]>();
+        calls.forEach(call => {
+            if (!call.timestamp) return;
+            const numbers = call.type_of_call === 'C2C' ? [call.called] : [call.caller];
+            numbers.forEach(num => {
+                if (!num) return;
+                if (!map.has(num)) map.set(num, []);
+                map.get(num)!.push(call);
+            });
+        });
+        map.forEach(bucket => bucket.sort((a, b) => {
+            const ta = toDate(a.timestamp)?.getTime() ?? 0;
+            const tb = toDate(b.timestamp)?.getTime() ?? 0;
+            return ta - tb;
+        }));
+        return map;
+    }, [calls]);
 
-    // --- DATA PIPELINES ---
-
-    // 1. Core Processed Data Arrays (Independent of specific table dropdowns, respects Date)
     const processedMissedCalls = useMemo(() => {
         return rawMissedCalls.map(missedCall => {
             const customerNumber = missedCall.caller;
-            if (!missedCall.timestamp) return { ...missedCall, callbackDone: false, resolutionStatus: 'Pending', callbackAgent: '-' } as MissedCall;
-            const missedTime = missedCall.timestamp.toDate().getTime();
+            const missedDate = toDate(missedCall.timestamp);
+            if (!missedDate) {
+                return { ...missedCall, callbackDone: false, resolutionStatus: 'Pending', callbackAgent: '-' } as MissedCall;
+            }
+            const missedTime = missedDate.getTime();
 
-            const subsequentCalls = calls.filter(call => {
-                if (!call.timestamp) return false;
-                const isC2CMatch = call.type_of_call === 'C2C' && call.called === customerNumber;
-                const isIncomingMatch = call.type_of_call === 'INCOMING' && call.caller === customerNumber;
-                const isAfter = call.timestamp.toDate().getTime() > missedTime;
-                return (isC2CMatch || isIncomingMatch) && isAfter;
+            const bucket = callsByCallerMap.get(customerNumber) || [];
+            const resolutionCall = bucket.find(call => {
+                const t = toDate(call.timestamp);
+                return t && t.getTime() > missedTime;
             });
 
-            if (subsequentCalls.length > 0) {
-                subsequentCalls.sort((a, b) => a.timestamp.toDate().getTime() - b.timestamp.toDate().getTime());
-                const resolutionCall = subsequentCalls[0];
+            if (resolutionCall) {
                 return {
                     ...missedCall,
                     callbackDone: true,
                     resolutionStatus: resolutionCall.type_of_call === 'C2C' ? 'Agent Callback' : 'Attended Later',
-                    callbackAgent: resolutionCall.agentName
+                    callbackAgent: resolutionCall.agentName,
                 } as MissedCall;
             }
             return {
                 ...missedCall,
                 callbackDone: false,
                 resolutionStatus: 'Pending',
-                callbackAgent: '-'
+                callbackAgent: '-',
             } as MissedCall;
         });
-    }, [rawMissedCalls, calls]);
+    }, [rawMissedCalls, callsByCallerMap]);
 
-    const statsAnswered = useMemo(() => calls.filter(c => isDateInRange(c.timestamp, computedDateRange)), [calls, computedDateRange]);
-    const statsMissed = useMemo(() => processedMissedCalls.filter(m => isDateInRange(m.timestamp, computedDateRange)), [processedMissedCalls, computedDateRange]);
+    // Data already date-filtered by Firestore query — no client-side re-filter needed.
+    const statsAnswered = useMemo(() => calls, [calls]);
+    const statsMissed = useMemo(() => processedMissedCalls, [processedMissedCalls]);
 
     const statsFrequent = useMemo(() => {
+        // Use a sentinel Timestamp-like object so callerMap entries have a valid initial date.
+        const makeSentinelTs = (ts: any) => ts;
+
         const callerMap = new Map<string, FrequentCaller>();
-        
+
         statsAnswered.forEach(data => {
             const callerNumber = data.type_of_call === 'C2C' ? data.called : data.caller;
             if (!callerNumber || callerNumber.trim() === '') return;
-            
+
             if (!callerMap.has(callerNumber)) {
                 callerMap.set(callerNumber, {
-                    phoneNumber: callerNumber, totalCalls: 0, answeredCalls: 0, missedCalls: 0, lastCallDate: data.timestamp, firstCallDate: data.timestamp, avgScore: 0,
-                    topAgents: [], callPurposes: [], sentimentDistribution: { positive: 0, negative: 0, neutral: 0 }, averageDuration: 0, callFrequency: 'occasional'
+                    phoneNumber: callerNumber, totalCalls: 0, answeredCalls: 0, missedCalls: 0,
+                    lastCallDate: makeSentinelTs(data.timestamp), firstCallDate: makeSentinelTs(data.timestamp),
+                    avgScore: 0, topAgents: [], callPurposes: [],
+                    sentimentDistribution: { positive: 0, negative: 0, neutral: 0 },
+                    averageDuration: 0, callFrequency: 'occasional'
                 });
             }
             const caller = callerMap.get(callerNumber)!;
             caller.totalCalls += 1;
             caller.answeredCalls += 1;
-            if (data.timestamp.toDate() > caller.lastCallDate.toDate()) caller.lastCallDate = data.timestamp;
-            if (data.timestamp.toDate() < caller.firstCallDate.toDate()) caller.firstCallDate = data.timestamp;
+
+            const tsDate = toDate(data.timestamp);
+            const lastDate = toDate(caller.lastCallDate);
+            const firstDate = toDate(caller.firstCallDate);
+            if (tsDate && lastDate && tsDate > lastDate) caller.lastCallDate = data.timestamp;
+            if (tsDate && firstDate && tsDate < firstDate) caller.firstCallDate = data.timestamp;
+
             if (data.overallScore) caller.avgScore = ((caller.avgScore || 0) * (caller.answeredCalls - 1) + data.overallScore) / caller.answeredCalls;
-            
+
             const agentIndex = caller.topAgents.findIndex(a => a.agentName === data.agentName);
             if (agentIndex >= 0) caller.topAgents[agentIndex].count += 1;
             else caller.topAgents.push({ agentName: data.agentName, count: 1 });
-            
+
             const purpose = data.callType?.primary || 'Unknown';
             const purposeIndex = caller.callPurposes.findIndex(p => p.purpose === purpose);
             if (purposeIndex >= 0) caller.callPurposes[purposeIndex].count += 1;
-            else caller.callPurposes.push({ purpose: purpose, count: 1 });
-            
+            else caller.callPurposes.push({ purpose, count: 1 });
+
             const sentiment = data.sentiment?.toLowerCase() || 'neutral';
             if (sentiment.includes('positive')) caller.sentimentDistribution.positive += 1;
             else if (sentiment.includes('negative')) caller.sentimentDistribution.negative += 1;
             else caller.sentimentDistribution.neutral += 1;
-            
+
             caller.averageDuration = ((caller.averageDuration || 0) * (caller.answeredCalls - 1) + (data.duration || 0)) / caller.answeredCalls;
         });
-        
+
         statsMissed.forEach(call => {
             const callerNumber = call.caller;
             if (!callerNumber || callerNumber.trim() === '') return;
             if (!callerMap.has(callerNumber)) {
                 callerMap.set(callerNumber, {
-                    phoneNumber: callerNumber, totalCalls: 0, answeredCalls: 0, missedCalls: 0, lastCallDate: call.timestamp, firstCallDate: call.timestamp, avgScore: 0,
-                    topAgents: [], callPurposes: [], sentimentDistribution: { positive: 0, negative: 0, neutral: 0 }, averageDuration: 0, callFrequency: 'occasional'
+                    phoneNumber: callerNumber, totalCalls: 0, answeredCalls: 0, missedCalls: 0,
+                    lastCallDate: makeSentinelTs(call.timestamp), firstCallDate: makeSentinelTs(call.timestamp),
+                    avgScore: 0, topAgents: [], callPurposes: [],
+                    sentimentDistribution: { positive: 0, negative: 0, neutral: 0 },
+                    averageDuration: 0, callFrequency: 'occasional'
                 });
             }
             const caller = callerMap.get(callerNumber)!;
             caller.totalCalls += 1;
             caller.missedCalls += 1;
-            if (call.timestamp.toDate() > caller.lastCallDate.toDate()) caller.lastCallDate = call.timestamp;
-            if (call.timestamp.toDate() < caller.firstCallDate.toDate()) caller.firstCallDate = call.timestamp;
+
+            const tsDate = toDate(call.timestamp);
+            const lastDate = toDate(caller.lastCallDate);
+            const firstDate = toDate(caller.firstCallDate);
+            if (tsDate && lastDate && tsDate > lastDate) caller.lastCallDate = call.timestamp;
+            if (tsDate && firstDate && tsDate < firstDate) caller.firstCallDate = call.timestamp;
         });
-        
+
         let freqArray = Array.from(callerMap.values()).filter(c => c.totalCalls >= minCallsThreshold);
         freqArray.forEach(caller => {
-            const daysBetween = (caller.lastCallDate.toDate().getTime() - caller.firstCallDate.toDate().getTime()) / (1000 * 3600 * 24);
+            const lastMs = toDate(caller.lastCallDate)?.getTime() ?? 0;
+            const firstMs = toDate(caller.firstCallDate)?.getTime() ?? 0;
+            const daysBetween = (lastMs - firstMs) / (1000 * 3600 * 24);
             const callsPerDay = caller.totalCalls / Math.max(daysBetween, 1);
             if (callsPerDay >= 1) caller.callFrequency = 'daily';
             else if (callsPerDay >= 0.14) caller.callFrequency = 'weekly';
             else if (callsPerDay >= 0.033) caller.callFrequency = 'monthly';
             else caller.callFrequency = 'occasional';
-            
+
             caller.topAgents.sort((a, b) => b.count - a.count);
             caller.callPurposes.sort((a, b) => b.count - a.count);
         });
-        
+
         return freqArray.sort((a, b) => b.totalCalls - a.totalCalls);
     }, [statsAnswered, statsMissed, minCallsThreshold]);
 
@@ -534,7 +634,7 @@ export default function ManagerCallHistory({ setActiveView, user, isDarkMode }: 
             let aVal: any, bVal: any;
             switch (sortField) {
                 case 'agentName': aVal = a.agentName?.toLowerCase() || ''; bVal = b.agentName?.toLowerCase() || ''; break;
-                case 'date': aVal = a.timestamp ? a.timestamp.toDate().getTime() : 0; bVal = b.timestamp ? b.timestamp.toDate().getTime() : 0; break;
+                case 'date': aVal = a.timestamp ? (toDate(a.timestamp)?.getTime() ?? 0) : 0; bVal = b.timestamp ? (toDate(b.timestamp)?.getTime() ?? 0) : 0; break;
                 case 'score': aVal = a.overallScore || 0; bVal = b.overallScore || 0; break;
                 case 'duration': aVal = a.duration || 0; bVal = b.duration || 0; break;
                 default: return 0;
@@ -571,7 +671,7 @@ export default function ManagerCallHistory({ setActiveView, user, isDarkMode }: 
 
 
     // Generate Top View Aggregated Data specifically using 'Stats' arrays ensuring independent logic
-    const { incomingCalls, c2cCalls, callsToday, uniqueAgentsToday } = useMemo(() => {
+    const { incomingCalls, c2cCalls, uniqueAgentsToday } = useMemo(() => {
         const today = new Date();
         const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
         const endOfToday = startOfToday + 24 * 60 * 60 * 1000;
@@ -581,8 +681,8 @@ export default function ManagerCallHistory({ setActiveView, user, isDarkMode }: 
         const uniqueAgents = new Set<string>();
 
         const todayCalls = calls.filter(call => {
-            const callTime = call.timestamp.toMillis();
-            if (callTime >= startOfToday && callTime < endOfToday) {
+            const d = call.timestamp ? (typeof call.timestamp.toMillis === 'function' ? call.timestamp.toMillis() : (call.timestamp.seconds ? call.timestamp.seconds * 1000 : 0)) : 0;
+            if (d >= startOfToday && d < endOfToday) {
                 uniqueAgents.add(call.agentId);
                 return true;
             }
@@ -597,19 +697,14 @@ export default function ManagerCallHistory({ setActiveView, user, isDarkMode }: 
         };
     }, [statsAnswered, calls]);
 
-    const frequentCallersStats = useMemo(() => {
-        if (callView === 'frequent') {
-            return {
-                totalFrequentCallers: statsFrequent.length,
-                totalCallsFromFrequent: statsFrequent.reduce((acc, caller) => acc + caller.totalCalls, 0),
-                avgCallsPerFrequent: statsFrequent.length > 0 
-                    ? (statsFrequent.reduce((acc, caller) => acc + caller.totalCalls, 0) / statsFrequent.length).toFixed(1)
-                    : '0.0',
-                topCaller: statsFrequent[0]
-            };
-        }
-        return null;
-    }, [statsFrequent, callView]);
+    const frequentCallersStats = useMemo(() => ({
+        totalFrequentCallers: statsFrequent.length,
+        totalCallsFromFrequent: statsFrequent.reduce((acc, caller) => acc + caller.totalCalls, 0),
+        avgCallsPerFrequent: statsFrequent.length > 0
+            ? (statsFrequent.reduce((acc, caller) => acc + caller.totalCalls, 0) / statsFrequent.length).toFixed(1)
+            : '0.0',
+        topCaller: statsFrequent[0]
+    }), [statsFrequent]);
 
 
     const totalCallsCount = statsAnswered.length;
